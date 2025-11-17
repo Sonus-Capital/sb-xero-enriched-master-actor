@@ -321,3 +321,7 @@ async def main() -> None:
             f"Done. Year={year}, enriched_rows={len(enriched_rows)}, "
             f"kv_file={filename}"
         )
+
+
+if __name__ == "__main__":
+    Actor.run(main)
