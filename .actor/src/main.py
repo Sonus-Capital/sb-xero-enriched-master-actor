@@ -1,6 +1,5 @@
 import csv
 import io
-import json
 import urllib.request
 from typing import List, Dict, Any, Tuple, Set
 
@@ -30,7 +29,6 @@ def download_csv(url: str, label: str) -> List[Dict[str, Any]]:
     with urllib.request.urlopen(url) as resp:
         csv_bytes = resp.read()
 
-    # Decode text
     text = csv_bytes.decode("utf-8", errors="replace")
 
     rows: List[Dict[str, Any]] = []
@@ -66,134 +64,46 @@ def download_csv(url: str, label: str) -> List[Dict[str, Any]]:
     return rows
 
 
-def invoice_key_from_ledger(row: Dict[str, Any]) -> str:
-    # Typical ledger header: "Invoice Number"
-    return norm(
-        row.get("Invoice Number")
-        or row.get("Invoice number")
-        or row.get("Invoice No")
-        or row.get("Invoice")
-    ).upper()
+def invoice_key_generic(row: Dict[str, Any]) -> str:
+    """Build a robust invoice key from whatever invoice/Xero fields exist."""
+    return (
+        norm(
+            row.get("Invoice Number")
+            or row.get("Invoice number")
+            or row.get("Invoice No")
+            or row.get("Invoice")
+            or row.get("Xero number")
+            or row.get("Xero Number")
+            or row.get("Invoice ID")
+            or row.get("InvoiceID")
+            or row.get("Xero Invoice ID")
+        )
+        .upper()
+    )
 
 
-def invoice_key_from_master(row: Dict[str, Any]) -> str:
-    # Your master financials: "Xero number" or "Invoice Number"
-    return norm(
-        row.get("Xero number")
-        or row.get("Invoice Number")
-        or row.get("Invoice number")
-        or row.get("Invoice")
-    ).upper()
-
-
-def invoice_key_from_invoices(row: Dict[str, Any]) -> str:
-    # Invoice master CSV: usually "Invoice Number"
-    return norm(
-        row.get("Invoice Number")
-        or row.get("Invoice number")
-        or row.get("Xero number")
-        or row.get("Invoice")
-    ).upper()
-
-
-def build_coverage(
-    ledger_rows: List[Dict[str, Any]],
-    master_rows: List[Dict[str, Any]],
-    invoice_rows: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Set[str], Set[str], Set[str]]:
-    """Build invoice-level coverage rows and return (rows, ledger_keys, master_keys, invoice_keys)."""
-
-    ledger_map: Dict[str, List[Dict[str, Any]]] = {}
-    master_map: Dict[str, List[Dict[str, Any]]] = {}
-    invoice_map: Dict[str, List[Dict[str, Any]]] = {}
-
-    # Index ledger
-    for r in ledger_rows:
-        k = invoice_key_from_ledger(r)
+def build_maps(
+    rows: List[Dict[str, Any]],
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Set[str]]:
+    m: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        k = invoice_key_generic(r)
         if not k:
             continue
-        ledger_map.setdefault(k, []).append(r)
+        m.setdefault(k, []).append(r)
+    return m, set(m.keys())
 
-    # Index master financials
-    for r in master_rows:
-        k = invoice_key_from_master(r)
-        if not k:
-            continue
-        master_map.setdefault(k, []).append(r)
 
-    # Index invoice master
-    for r in invoice_rows:
-        k = invoice_key_from_invoices(r)
-        if not k:
-            continue
-        invoice_map.setdefault(k, []).append(r)
-
-    ledger_keys = set(ledger_map.keys())
-    master_keys = set(master_map.keys())
-    invoice_keys = set(invoice_map.keys())
-
-    all_keys = ledger_keys | master_keys | invoice_keys
-
-    coverage_rows: List[Dict[str, Any]] = []
-
-    for inv_key in sorted(all_keys):
-        l_rows = ledger_map.get(inv_key, [])
-        m_rows = master_map.get(inv_key, [])
-        i_rows = invoice_map.get(inv_key, [])
-
-        in_ledger = bool(l_rows)
-        in_master = bool(m_rows)
-        in_invoices = bool(i_rows)
-
-        # Very simple issue classification
-        if in_ledger and in_master and in_invoices:
-            issue = "OK_ALL_THREE"
-        elif in_ledger and in_master and not in_invoices:
-            issue = "NO_INVOICE_MASTER"
-        elif in_ledger and not in_master and in_invoices:
-            issue = "NO_MASTER_FINANCIALS"
-        elif not in_ledger and in_master and in_invoices:
-            issue = "MISSING_LEDGER"
-        elif in_ledger and not in_master and not in_invoices:
-            issue = "LEDGER_ONLY"
-        elif not in_ledger and in_master and not in_invoices:
-            issue = "MASTER_ONLY"
-        elif not in_ledger and not in_master and in_invoices:
-            issue = "INVOICE_ONLY"
-        else:
-            issue = "UNKNOWN_PATTERN"
-
-        # Sample description fields
-        sample_ledger_desc = norm(
-            (l_rows[0].get("Description") if l_rows else "")
-            or (l_rows[0].get("Narration") if l_rows else "")
-        )
-        sample_master_desc = norm(
-            (m_rows[0].get("Description") if m_rows else "")
-            or (m_rows[0].get("Contact") if m_rows else "")
-        )
-        sample_invoice_desc = norm(
-            (i_rows[0].get("Description") if i_rows else "")
-            or (i_rows[0].get("Contact") if i_rows else "")
-        )
-
-        coverage_rows.append(
-            {
-                "Invoice_Key": inv_key,
-                "In_Ledger": "Y" if in_ledger else "N",
-                "In_MasterFinancials": "Y" if in_master else "N",
-                "In_InvoiceMaster": "Y" if in_invoices else "N",
-                "Ledger_Row_Count": len(l_rows),
-                "Master_Line_Count": len(m_rows),
-                "Invoice_Line_Count": len(i_rows),
-                "Issue_Flag": issue,
-                "Sample_Ledger_Desc": sample_ledger_desc,
-                "Sample_Master_Desc": sample_master_desc,
-                "Sample_Invoice_Desc": sample_invoice_desc,
-            }
-        )
-
-    return coverage_rows, ledger_keys, master_keys, invoice_keys
+def pick_first(row_list: List[Dict[str, Any]], *field_candidates: str) -> str:
+    """Pick first non-empty field from the first row in a list, checking several names."""
+    if not row_list:
+        return ""
+    row = row_list[0]
+    for f in field_candidates:
+        v = row.get(f)
+        if v not in (None, ""):
+            return norm(v)
+    return ""
 
 
 # ----------------- Apify entrypoint -----------------
@@ -205,84 +115,100 @@ async def main() -> None:
         Actor.log.info(f"Actor input keys: {list(actor_input.keys())}")
 
         year = norm(actor_input.get("Year"))
-        ledger_url = norm(actor_input.get("LedgerUrl"))
-        master_url = norm(actor_input.get("MasterUrl"))
         invoices_url = norm(actor_input.get("InvoicesUrl"))
+        attach_url = norm(actor_input.get("AttachUrl"))
+        issues_url = norm(actor_input.get("IssuesUrl"))
 
         if not year:
             Actor.log.error("Missing 'Year' in input.")
             return
 
-        if not (ledger_url or master_url or invoices_url):
-            Actor.log.error("No URLs provided (LedgerUrl/MasterUrl/InvoicesUrl). Nothing to do.")
+        if not invoices_url:
+            Actor.log.error("InvoicesUrl is required; cannot build enriched master.")
             return
 
         # 1) Download CSVs
-        ledger_rows: List[Dict[str, Any]] = []
-        master_rows: List[Dict[str, Any]] = []
-        invoice_rows: List[Dict[str, Any]] = []
+        invoices_rows = download_csv(invoices_url, "invoices")
+        attach_rows = download_csv(attach_url, "attachments") if attach_url else []
+        issues_rows = download_csv(issues_url, "issues") if issues_url else []
 
-        if ledger_url:
-            ledger_rows = download_csv(ledger_url, "ledger")
-        else:
-            Actor.log.warning("No LedgerUrl provided; skipping ledger.")
-
-        if master_url:
-            master_rows = download_csv(master_url, "master")
-        else:
-            Actor.log.warning("No MasterUrl provided; skipping master financials.")
-
-        if invoices_url:
-            invoice_rows = download_csv(invoices_url, "invoices")
-        else:
-            Actor.log.warning("No InvoicesUrl provided; skipping invoice master.")
-
-        total_rows = len(ledger_rows) + len(master_rows) + len(invoice_rows)
-        if total_rows == 0:
-            Actor.log.error("All CSVs are empty or failed to parse; aborting.")
+        if not invoices_rows:
+            Actor.log.error("Invoice master CSV is empty or failed to parse; aborting.")
             return
 
         Actor.log.info(
-            f"Row counts: ledger={len(ledger_rows)}, "
-            f"master={len(master_rows)}, invoices={len(invoice_rows)}"
+            f"Row counts: invoices={len(invoices_rows)}, "
+            f"attachments={len(attach_rows)}, issues={len(issues_rows)}"
         )
 
-        # 2) Build coverage
-        coverage_rows, ledger_keys, master_keys, invoice_keys = build_coverage(
-            ledger_rows, master_rows, invoice_rows
-        )
+        # 2) Build maps by invoice key
+        attach_map, attach_keys = build_maps(attach_rows)
+        issues_map, issues_keys = build_maps(issues_rows)
 
         Actor.log.info(
-            f"Key coverage: ledger_keys={len(ledger_keys)}, "
-            f"master_keys={len(master_keys)}, invoice_keys={len(invoice_keys)}, "
-            f"coverage_rows={len(coverage_rows)}"
+            f"Key coverage: attach_keys={len(attach_keys)}, issues_keys={len(issues_keys)}"
         )
 
-        # 3) Write CSV to KV store
-        filename = f"tx_master_audit_{year}.csv"
-
-        fieldnames = [
-            "Year",
-            "Invoice_Key",
-            "In_Ledger",
-            "In_MasterFinancials",
-            "In_InvoiceMaster",
-            "Ledger_Row_Count",
-            "Master_Line_Count",
-            "Invoice_Line_Count",
-            "Issue_Flag",
-            "Sample_Ledger_Desc",
-            "Sample_Master_Desc",
-            "Sample_Invoice_Desc",
+        # 3) Prepare output field order:
+        #    preserve invoice CSV column order, then append enrichment fields.
+        invoice_fieldnames = list(invoices_rows[0].keys())
+        enrich_fields = [
+            "Has_Attachments",
+            "Attachment_Count",
+            "Sample_Attach_Name",
+            "Has_Issues",
+            "Issue_Count",
+            "Sample_Issue_Desc",
         ]
+        fieldnames = invoice_fieldnames + enrich_fields
 
+        # 4) Build enriched rows
+        enriched_rows: List[Dict[str, Any]] = []
+
+        for inv in invoices_rows:
+            key = invoice_key_generic(inv)
+            a_rows = attach_map.get(key, [])
+            i_rows = issues_map.get(key, [])
+
+            attach_count = len(a_rows)
+            issue_count = len(i_rows)
+
+            sample_attach_name = pick_first(
+                a_rows,
+                "File name",
+                "Filename",
+                "Name",
+                "Attachment name",
+                "Attachment",
+            )
+            sample_issue_desc = pick_first(
+                i_rows,
+                "Issue_Flag",
+                "Issue",
+                "Untracked reason",
+                "Reason",
+                "Issue description",
+            )
+
+            out = dict(inv)  # copy original invoice row
+            out["Has_Attachments"] = "Y" if attach_count > 0 else "N"
+            out["Attachment_Count"] = attach_count
+            out["Sample_Attach_Name"] = sample_attach_name
+            out["Has_Issues"] = "Y" if issue_count > 0 else "N"
+            out["Issue_Count"] = issue_count
+            out["Sample_Issue_Desc"] = sample_issue_desc
+
+            enriched_rows.append(out)
+
+        Actor.log.info(f"Enriched rows: {len(enriched_rows)}")
+
+        # 5) Write CSV to KV store
+        filename = f"invoice_master_enriched_{year}.csv"
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        for row in coverage_rows:
-            out = dict(row)
-            out["Year"] = year
-            writer.writerow(out)
+        for row in enriched_rows:
+            writer.writerow(row)
 
         csv_data = buf.getvalue()
 
@@ -292,20 +218,19 @@ async def main() -> None:
             content_type="text/csv; charset=utf-8",
         )
 
-        # 4) Push a small JSON summary to dataset so Apify "Get dataset" is non-empty
+        # 6) Push a small JSON summary to dataset
         summary = {
             "year": year,
-            "ledger_rows": len(ledger_rows),
-            "master_rows": len(master_rows),
-            "invoice_rows": len(invoice_rows),
-            "invoice_keys_total": len(ledger_keys | master_keys | invoice_keys),
-            "coverage_rows": len(coverage_rows),
+            "invoice_rows": len(invoices_rows),
+            "attachment_rows": len(attach_rows),
+            "issue_rows": len(issues_rows),
+            "enriched_rows": len(enriched_rows),
             "kv_filename": filename,
         }
         await Actor.push_data(summary)
 
         Actor.log.info(
-            f"Done. Year={year}, coverage_rows={len(coverage_rows)}, "
+            f"Done. Year={year}, enriched_rows={len(enriched_rows)}, "
             f"kv_file={filename}"
         )
 
