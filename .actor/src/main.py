@@ -24,6 +24,21 @@ def download_csv(url: str, label: str) -> List[Dict[str, Any]]:
     if not url:
         return []
 
+    def invoice_key_from_issues(row: Dict[str, Any]) -> str:
+    """Key function specialised for the Issues master."""
+    return (
+        norm(
+            row.get("Invoice_Key")
+            or row.get("Invoice key")
+            or row.get("Key")
+            or row.get("Invoice ID")
+            or row.get("Invoice Number")
+            or row.get("Invoice number")
+            or row.get("Xero number")
+        )
+        .upper()
+    )
+
     Actor.log.info(f"Downloading {label} CSV from {url}")
 
     with urllib.request.urlopen(url) as resp:
@@ -82,12 +97,16 @@ def invoice_key_generic(row: Dict[str, Any]) -> str:
     )
 
 
-def build_maps(
+from typing import Callable  # add at the top with the other imports
+
+
+def build_map_with_key(
     rows: List[Dict[str, Any]],
+    key_fn: Callable[[Dict[str, Any]], str],
 ) -> Tuple[Dict[str, List[Dict[str, Any]]], Set[str]]:
     m: Dict[str, List[Dict[str, Any]]] = {}
     for r in rows:
-        k = invoice_key_generic(r)
+        k = key_fn(r)
         if not k:
             continue
         m.setdefault(k, []).append(r)
@@ -141,9 +160,9 @@ async def main() -> None:
             f"attachments={len(attach_rows)}, issues={len(issues_rows)}"
         )
 
-        # 2) Build maps by invoice key
-        attach_map, attach_keys = build_maps(attach_rows)
-        issues_map, issues_keys = build_maps(issues_rows)
+        # 2) Build maps by invoice key (different key fns per source)
+        attach_map, attach_keys = build_map_with_key(attach_rows, invoice_key_generic)
+        issues_map, issues_keys = build_map_with_key(issues_rows, invoice_key_from_issues)
 
         Actor.log.info(
             f"Key coverage: attach_keys={len(attach_keys)}, issues_keys={len(issues_keys)}"
