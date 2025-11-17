@@ -1,8 +1,9 @@
+import asyncio
 import csv
 import io
 import json
 import urllib.request
-from typing import List, Dict, Any, Tuple, Set
+from typing import Any, Dict, List, Tuple, Set
 
 from apify import Actor
 
@@ -10,48 +11,54 @@ from apify import Actor
 # ----------------- small helpers -----------------
 
 
-def norm(value: Any) -> str:
-    """Normalize a field to a stripped string, or empty string for None."""
-    if value is None:
+def norm(s: Any) -> str:
+    """Normalise a value to a trimmed string (or empty string)."""
+    if s is None:
         return ""
-    return str(value).strip()
+    return str(s).strip()
 
 
-def download_csv(url: str, label: str) -> List[Dict[str, Any]]:
+def download_csv(url: str, label: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Download a CSV from Dropbox and parse it into a list of dicts.
 
-    Primary attempt: csv.DictReader.
-    Fallback: simple split-based parser if DictReader chokes (bad newlines, etc.).
+    Returns (rows, header_fieldnames).
+
+    Primary attempt: csv.DictReader (normal).
+    Fallback: very simple split-based parser if DictReader chokes (e.g. bad newlines).
     """
     if not url:
-        return []
+        return [], []
 
     Actor.log.info(f"Downloading {label} CSV from {url}")
 
     with urllib.request.urlopen(url) as resp:
         csv_bytes = resp.read()
 
+    # Decode text
     text = csv_bytes.decode("utf-8", errors="replace")
 
     rows: List[Dict[str, Any]] = []
+    header: List[str] = []
 
     # First try: normal DictReader
     try:
-        reader = csv.DictReader(io.StringIO(text))
+        sio = io.StringIO(text)
+        reader = csv.DictReader(sio)
+        header = reader.fieldnames or []
         rows = [dict(r) for r in reader]
         Actor.log.info(f"{label} rows (DictReader): {len(rows)}")
-        return rows
+        return rows, header
     except csv.Error as e:
         Actor.log.warning(
             f"{label} CSV parse via DictReader failed: {e!r}. "
             f"Falling back to simple split parser; some rows may be skipped."
         )
 
-    # Fallback parser
+    # Fallback: naive split-by-line, split-by-comma parser.
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if not lines:
         Actor.log.warning(f"{label} CSV has no non-empty lines after fallback parsing.")
-        return []
+        return [], []
 
     header = [h.strip() for h in lines[0].split(",")]
     for ln in lines[1:]:
@@ -63,174 +70,188 @@ def download_csv(url: str, label: str) -> List[Dict[str, Any]]:
         rows.append(row)
 
     Actor.log.info(f"{label} rows (fallback): {len(rows)}")
-    return rows
+    return rows, header
 
 
 # ----------------- key functions -----------------
 
 
 def invoice_key_from_invoices(row: Dict[str, Any]) -> str:
-    """Key function for the invoice master (2016_Master_Invoices…)."""
-    return (
-        norm(
-            row.get("Invoice ID")
-            or row.get("InvoiceId")
-            or row.get("InvoiceID")
-            or row.get("Xero number")
-            or row.get("Xero Number")
-            or row.get("Invoice Number")
-            or row.get("Invoice number")
-            or row.get("Invoice")
-            or row.get("Key")
-        )
-        .upper()
-    )
+    """Key function for the invoice master (2016_Master_Invoices etc.)."""
+    return norm(
+        row.get("Invoice ID")
+        or row.get("InvoiceID")
+        or row.get("Invoice Id")
+        or row.get("Xero number")
+        or row.get("Invoice Number")
+        or row.get("Invoice")
+    ).upper()
 
 
 def invoice_key_from_attachments(row: Dict[str, Any]) -> str:
-    """Key function for the attachment master (2016_Master_Attachments…)."""
-    return (
-        norm(
-            row.get("Invoice ID")
-            or row.get("InvoiceId")
-            or row.get("InvoiceID")
-            or row.get("Xero number")
-            or row.get("Xero Number")
-            or row.get("Invoice Number")
-            or row.get("Invoice number")
-            or row.get("Invoice")
-            or row.get("Key")
-        )
-        .upper()
-    )
+    """Key function for the attachments master (2016_Master_Attachments etc.)."""
+    return norm(
+        row.get("Invoice ID")
+        or row.get("InvoiceID")
+        or row.get("Invoice Id")
+        or row.get("Xero number")
+        or row.get("Invoice Number")
+        or row.get("Invoice")
+    ).upper()
 
 
 def invoice_key_from_issues(row: Dict[str, Any]) -> str:
-    """Key function for the issues master (2016_Master_Issues…)."""
-    return (
-        norm(
-            row.get("Invoice ID")
-            or row.get("InvoiceId")
-            or row.get("InvoiceID")
-            or row.get("Xero number")
-            or row.get("Xero Number")
-            or row.get("Invoice Number")
-            or row.get("Invoice number")
-            or row.get("Invoice")
-            or row.get("Key")
-        )
-        .upper()
-    )
+    """Key function for the issues master (2016_Master_Issues etc.)."""
+    return norm(
+        row.get("Invoice ID")
+        or row.get("InvoiceID")
+        or row.get("Invoice Id")
+        or row.get("Key")  # fallback to your 'Key' column if present
+    ).upper()
 
 
 # ----------------- enrichment logic -----------------
 
 
+def build_index(
+    rows: List[Dict[str, Any]], key_fn
+) -> Dict[str, List[Dict[str, Any]]]:
+    index: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        k = key_fn(r)
+        if not k:
+            continue
+        index.setdefault(k, []).append(r)
+    return index
+
+
+def extract_attachment_fields(attach_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate attachment metadata for a single invoice key."""
+    doc_ids: Set[str] = set()
+    file_names: Set[str] = set()
+    paths: Set[str] = set()
+
+    for r in attach_rows:
+        doc_id = norm(
+            r.get("Doc ID")
+            or r.get("DocID")
+            or r.get("Attachment ID")
+            or r.get("AttachmentId")
+            or r.get("Id")
+        )
+        if doc_id:
+            doc_ids.add(doc_id)
+
+        name = norm(
+            r.get("name")
+            or r.get("Name")
+            or r.get("file_name")
+            or r.get("File Name")
+            or r.get("FileName")
+        )
+        if name:
+            file_names.add(name)
+
+        path = norm(
+            r.get("path_lower")
+            or r.get("Path_Lower")
+            or r.get("dbx_path_lower")
+            or r.get("Dropbox path lower")
+            or r.get("path_display")
+        )
+        if path:
+            paths.add(path)
+
+    # Build Dropbox API download args for convenience
+    download_args: List[str] = []
+    for p in sorted(paths):
+        if not p:
+            continue
+        # This is the string you plug into Dropbox-API-Arg header
+        # e.g. {"path": "/sona/..."}
+        download_args.append(json.dumps({"path": p}, separators=(",", ":")))
+
+    return {
+        "Enriched_Attachment_Count": len(attach_rows),
+        "Enriched_Attachment_Doc_IDs": "; ".join(sorted(doc_ids)) if doc_ids else "",
+        "Enriched_Attachment_File_Names": "; ".join(sorted(file_names)) if file_names else "",
+        "Enriched_Attachment_Paths": "; ".join(sorted(paths)) if paths else "",
+        "Enriched_Attachment_Download_Args": "; ".join(download_args) if download_args else "",
+    }
+
+
+def extract_issue_fields(issue_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate issue flags / notes for a single invoice key."""
+    flags: Set[str] = set()
+
+    for r in issue_rows:
+        flag = norm(
+            r.get("Issue_Flag")
+            or r.get("Issue flag")
+            or r.get("Issue Flag")
+            or r.get("Issue")
+            or r.get("Status")
+        )
+        if flag:
+            flags.add(flag)
+
+    return {
+        "Enriched_Issue_Count": len(issue_rows),
+        "Enriched_Issue_Flags": "; ".join(sorted(flags)) if flags else "",
+    }
+
+
 def build_enriched_rows(
-    invoices: List[Dict[str, Any]],
-    attachments: List[Dict[str, Any]],
-    issues: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Set[str], Set[str]]:
-    """Return the enriched invoice rows, and the sets of attachment and issue keys used."""
+    invoice_rows: List[Dict[str, Any]],
+    attach_rows: List[Dict[str, Any]],
+    issue_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Merge invoice, attachment, and issues data into enriched invoice rows."""
+    attach_index = build_index(attach_rows, invoice_key_from_attachments)
+    issue_index = build_index(issue_rows, invoice_key_from_issues)
 
-    attach_map: Dict[str, List[Dict[str, Any]]] = {}
-    issues_map: Dict[str, List[Dict[str, Any]]] = {}
+    attach_keys = set(attach_index.keys())
+    issue_keys = set(issue_index.keys())
 
-    # Index attachments
-    for row in attachments:
-        k = invoice_key_from_attachments(row)
-        if not k:
-            continue
-        attach_map.setdefault(k, []).append(row)
-
-    # Index issues
-    for row in issues:
-        k = invoice_key_from_issues(row)
-        if not k:
-            continue
-        issues_map.setdefault(k, []).append(row)
-
-    attach_keys = set(attach_map.keys())
-    issue_keys = set(issues_map.keys())
+    Actor.log.info(
+        f"Key coverage: attach_keys={len(attach_keys)}, issues_keys={len(issue_keys)}"
+    )
 
     enriched: List[Dict[str, Any]] = []
 
-    for inv in invoices:
-        inv_key = invoice_key_from_invoices(inv)
-        inv_key_upper = inv_key.upper()
+    for inv in invoice_rows:
+        key = invoice_key_from_invoices(inv)
+        inv_copy = dict(inv)  # do not mutate original
 
-        inv_attach_rows = attach_map.get(inv_key_upper, [])
-        inv_issue_rows = issues_map.get(inv_key_upper, [])
+        a_rows = attach_index.get(key, [])
+        i_rows = issue_index.get(key, [])
 
-        # Attachments: collect Doc IDs and Source Docs if present
-        doc_ids = sorted(
-            {
-                norm(
-                    r.get("Doc ID")
-                    or r.get("DocId")
-                    or r.get("Document ID")
-                    or r.get("Attachment ID")
-                    or r.get("AttachmentId")
-                )
-                for r in inv_attach_rows
-                if norm(
-                    r.get("Doc ID")
-                    or r.get("DocId")
-                    or r.get("Document ID")
-                    or r.get("Attachment ID")
-                    or r.get("AttachmentId")
-                )
+        # Attachments
+        attach_fields = (
+            extract_attachment_fields(a_rows) if a_rows else {
+                "Enriched_Attachment_Count": 0,
+                "Enriched_Attachment_Doc_IDs": "",
+                "Enriched_Attachment_File_Names": "",
+                "Enriched_Attachment_Paths": "",
+                "Enriched_Attachment_Download_Args": "",
             }
         )
 
-        source_docs = sorted(
-            {
-                norm(r.get("Source Doc") or r.get("Source_Doc") or r.get("Source"))
-                for r in inv_attach_rows
-                if norm(r.get("Source Doc") or r.get("Source_Doc") or r.get("Source"))
+        # Issues
+        issue_fields = (
+            extract_issue_fields(i_rows) if i_rows else {
+                "Enriched_Issue_Count": 0,
+                "Enriched_Issue_Flags": "",
             }
         )
 
-        # Issues: collect flags/descriptions if present
-        issue_flags = sorted(
-            {
-                norm(
-                    r.get("Issue Flag")
-                    or r.get("Issue_Flag")
-                    or r.get("Issue")
-                    or r.get("Issue code")
-                    or r.get("Issue_code")
-                    or r.get("Untracked reason")
-                    or r.get("Reviewer decision")
-                )
-                for r in inv_issue_rows
-                if norm(
-                    r.get("Issue Flag")
-                    or r.get("Issue_Flag")
-                    or r.get("Issue")
-                    or r.get("Issue code")
-                    or r.get("Issue_code")
-                    or r.get("Untracked reason")
-                    or r.get("Reviewer decision")
-                )
-            }
-        )
+        inv_copy.update(attach_fields)
+        inv_copy.update(issue_fields)
 
-        out_row = dict(inv)  # start with invoice master fields
+        enriched.append(inv_copy)
 
-        # Enrichment fields
-        out_row["Enriched_Attachment_Count"] = str(len(inv_attach_rows))
-        out_row["Enriched_Attachment_Doc_IDs"] = "; ".join(doc_ids) if doc_ids else ""
-        out_row["Enriched_Attachment_Source_Docs"] = (
-            "; ".join(source_docs) if source_docs else ""
-        )
-        out_row["Enriched_Issue_Count"] = str(len(inv_issue_rows))
-        out_row["Enriched_Issue_Flags"] = "; ".join(issue_flags) if issue_flags else ""
-        out_row["Enriched_Invoice_Key"] = inv_key_upper
-
-        enriched.append(out_row)
-
-    return enriched, attach_keys, issue_keys
+    Actor.log.info(f"Enriched rows: {len(enriched)}")
+    return enriched
 
 
 # ----------------- Apify entrypoint -----------------
@@ -255,56 +276,47 @@ async def main() -> None:
             return
 
         # 1) Download CSVs
-        invoices_rows = download_csv(invoices_url, "invoices")
-        attachments_rows: List[Dict[str, Any]] = []
+        invoice_rows, invoice_header = download_csv(invoices_url, "invoices")
+        attach_rows: List[Dict[str, Any]] = []
         issues_rows: List[Dict[str, Any]] = []
 
         if attach_url:
-            attachments_rows = download_csv(attach_url, "attachments")
+            attach_rows, _ = download_csv(attach_url, "attachments")
         else:
-            Actor.log.warning("No AttachUrl provided; skipping attachment enrichment.")
+            Actor.log.warning("No AttachUrl provided; skipping attachments.")
 
         if issues_url:
-            issues_rows = download_csv(issues_url, "issues")
+            issues_rows, _ = download_csv(issues_url, "issues")
         else:
-            Actor.log.warning("No IssuesUrl provided; skipping issues enrichment.")
+            Actor.log.warning("No IssuesUrl provided; skipping issues.")
 
-        if not invoices_rows:
-            Actor.log.error("Invoices CSV is empty or failed to parse; aborting.")
+        Actor.log.info(
+            f"Row counts: invoices={len(invoice_rows)}, "
+            f"attachments={len(attach_rows)}, issues={len(issues_rows)}"
+        )
+
+        if not invoice_rows:
+            Actor.log.error("Invoice CSV had no rows; aborting.")
             return
 
-        Actor.log.info(
-            f"Row counts: invoices={len(invoices_rows)}, "
-            f"attachments={len(attachments_rows)}, issues={len(issues_rows)}"
-        )
-
         # 2) Build enriched rows
-        enriched_rows, attach_keys, issue_keys = build_enriched_rows(
-            invoices_rows, attachments_rows, issues_rows
-        )
+        enriched_rows = build_enriched_rows(invoice_rows, attach_rows, issues_rows)
 
-        Actor.log.info(
-            f"Key coverage: attach_keys={len(attach_keys)}, "
-            f"issues_keys={len(issue_keys)}"
-        )
-        Actor.log.info(f"Enriched rows: {len(enriched_rows)}")
-
-        # 3) Write enriched CSV to KV store
+        # 3) Write CSV to KV store
         filename = f"invoice_master_enriched_{year}.csv"
 
-        # Preserve original invoice columns order, then append enrichment columns
-        invoice_fieldnames = list(invoices_rows[0].keys())
+        # Preserve original invoice column order and append enrichment columns
+        base_fields = invoice_header or list(invoice_rows[0].keys())
         enrichment_fields = [
             "Enriched_Attachment_Count",
             "Enriched_Attachment_Doc_IDs",
-            "Enriched_Attachment_Source_Docs",
+            "Enriched_Attachment_File_Names",
+            "Enriched_Attachment_Paths",
+            "Enriched_Attachment_Download_Args",
             "Enriched_Issue_Count",
             "Enriched_Issue_Flags",
-            "Enriched_Invoice_Key",
         ]
-        fieldnames = invoice_fieldnames + [
-            f for f in enrichment_fields if f not in invoice_fieldnames
-        ]
+        fieldnames = base_fields + [f for f in enrichment_fields if f not in base_fields]
 
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
@@ -320,11 +332,11 @@ async def main() -> None:
             content_type="text/csv; charset=utf-8",
         )
 
-        # 4) Push a small JSON summary to dataset
+        # 4) Push a small JSON summary to dataset so Make "Get dataset" works
         summary = {
             "year": year,
-            "invoice_rows": len(invoices_rows),
-            "attachment_rows": len(attachments_rows),
+            "invoice_rows": len(invoice_rows),
+            "attachment_rows": len(attach_rows),
             "issue_rows": len(issues_rows),
             "enriched_rows": len(enriched_rows),
             "kv_filename": filename,
@@ -337,6 +349,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(main())
